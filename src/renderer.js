@@ -17,7 +17,7 @@ import postFrag from './shaders/post.frag.glsl?raw';
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
-    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+    const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, preserveDrawingBuffer: true });
     if (!gl) throw new Error('WebGL2 not supported');
     this.gl = gl;
     this.programs = {};
@@ -29,6 +29,7 @@ export class Renderer {
     this.width = 0;
     this.height = 0;
     this.terrainIdxCount = 0;
+    this.fboReady = false;
     this.initPrograms();
     this.initGeometry();
   }
@@ -102,7 +103,7 @@ export class Renderer {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.terrainI);
     gl.bindVertexArray(null);
 
-    // branches (x,y,z,bright per vertex)
+    // branches
     this.vaos.branch = gl.createVertexArray();
     gl.bindVertexArray(this.vaos.branch);
     this.buffers.branchV = gl.createBuffer();
@@ -114,7 +115,7 @@ export class Renderer {
     if (bbL >= 0) { gl.enableVertexAttribArray(bbL); gl.vertexAttribPointer(bbL, 1, gl.FLOAT, false, 16, 12); }
     gl.bindVertexArray(null);
 
-    // stones (same format as branches)
+    // stones
     this.vaos.stone = gl.createVertexArray();
     gl.bindVertexArray(this.vaos.stone);
     this.buffers.stoneV = gl.createBuffer();
@@ -150,7 +151,7 @@ export class Renderer {
     if (pbL >= 0) { gl.enableVertexAttribArray(pbL); gl.vertexAttribPointer(pbL, 1, gl.FLOAT, false, 16, 12); }
     gl.bindVertexArray(null);
 
-    // grass (6 floats per vertex: x, baseY, z, height, phase, vertexT)
+    // grass
     this.vaos.grass = gl.createVertexArray();
     gl.bindVertexArray(this.vaos.grass);
     this.buffers.grassV = gl.createBuffer();
@@ -177,17 +178,56 @@ export class Renderer {
   initFBOs() {
     const gl = this.gl, w = this.width, h = this.height;
     if (!w || !h) return;
-    for (const k of Object.keys(this.fbos)) gl.deleteFramebuffer(this.fbos[k]);
-    for (const k of Object.keys(this.textures)) gl.deleteTexture(this.textures[k]);
-    if (this._depthRB) gl.deleteRenderbuffer(this._depthRB);
-    this.makeFBO('scene', w, h, true);
-    const qw = w >> 2, qh = h >> 2;
-    this.makeFBO('bright', qw, qh, false);
-    this.makeFBO('blur1', qw, qh, false);
-    this.makeFBO('blur2', qw, qh, false);
+
+    // clean up old
+    if (this._sceneFBO) gl.deleteFramebuffer(this._sceneFBO);
+    if (this._sceneTex) gl.deleteTexture(this._sceneTex);
+    if (this._sceneDepth) gl.deleteRenderbuffer(this._sceneDepth);
+    if (this._brightFBO) gl.deleteFramebuffer(this._brightFBO);
+    if (this._brightTex) gl.deleteTexture(this._brightTex);
+    if (this._blur1FBO) gl.deleteFramebuffer(this._blur1FBO);
+    if (this._blur1Tex) gl.deleteTexture(this._blur1Tex);
+    if (this._blur2FBO) gl.deleteFramebuffer(this._blur2FBO);
+    if (this._blur2Tex) gl.deleteTexture(this._blur2Tex);
+
+    // scene FBO (full res with depth)
+    const r = this._makeTex(w, h);
+    this._sceneTex = r.tex;
+    this._sceneFBO = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._sceneFBO);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._sceneTex, 0);
+    this._sceneDepth = gl.createRenderbuffer();
+    gl.bindRenderbuffer(gl.RENDERBUFFER, this._sceneDepth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, this._sceneDepth);
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      console.error('Scene FBO incomplete:', status);
+      this.fboReady = false;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return;
+    }
+
+    // bloom FBOs (quarter res, no depth)
+    const qw = Math.max(1, w >> 2), qh = Math.max(1, h >> 2);
+    const b = this._makeTex(qw, qh);
+    this._brightTex = b.tex;
+    this._brightFBO = this._makeSimpleFBO(b.tex);
+
+    const b1 = this._makeTex(qw, qh);
+    this._blur1Tex = b1.tex;
+    this._blur1FBO = this._makeSimpleFBO(b1.tex);
+
+    const b2 = this._makeTex(qw, qh);
+    this._blur2Tex = b2.tex;
+    this._blur2FBO = this._makeSimpleFBO(b2.tex);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.fboReady = true;
   }
 
-  makeFBO(name, w, h, depth) {
+  _makeTex(w, h) {
     const gl = this.gl;
     const tex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -196,19 +236,15 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    this.textures[name] = tex;
+    return { tex };
+  }
+
+  _makeSimpleFBO(tex) {
+    const gl = this.gl;
     const fbo = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
-    if (depth) {
-      const rb = gl.createRenderbuffer();
-      gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
-      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
-      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
-      this._depthRB = rb;
-    }
-    this.fbos[name] = fbo;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return fbo;
   }
 
   uploadWorld(world) {
@@ -220,13 +256,14 @@ export class Renderer {
 
   uploadTerrain(world) {
     const gl = this.gl;
-    if (world.terrainVerts) {
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.terrainV);
-      gl.bufferData(gl.ARRAY_BUFFER, world.terrainVerts, gl.DYNAMIC_DRAW);
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.terrainI);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, world.terrainIndices, gl.DYNAMIC_DRAW);
-      this.terrainIdxCount = world.terrainIdxCount;
-    }
+    if (!world.terrainVerts) return;
+    gl.bindVertexArray(this.vaos.terrain);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffers.terrainV);
+    gl.bufferData(gl.ARRAY_BUFFER, world.terrainVerts, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.buffers.terrainI);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, world.terrainIndices, gl.DYNAMIC_DRAW);
+    this.terrainIdxCount = world.terrainIdxCount;
+    gl.bindVertexArray(null);
   }
 
   uploadGrass(world) {
@@ -243,31 +280,16 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
   }
 
-  render(camera, world, time) {
+  drawScene(vp, camera, world, time) {
     const gl = this.gl, U = this.uniforms;
 
-    const proj = mat4.create();
-    mat4.perspective(proj, Math.PI / 3, this.width / this.height, 0.1, 250);
-    const view = mat4.create();
-    mat4.lookAt(view, camera.position, camera.target, [0, 1, 0]);
-    const vp = mat4.create();
-    mat4.multiply(vp, proj, view);
-
-    // Render directly to screen — no FBOs
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.width, this.height);
-    gl.clearColor(0.0, 0.0, 0.008, 1.0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    gl.disable(gl.BLEND);
-
-    // Sky
+    // Sky (no depth write)
     gl.disable(gl.DEPTH_TEST);
     gl.depthMask(false);
     gl.useProgram(this.programs.sky);
     gl.bindVertexArray(this.vaos.quad);
     gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
     gl.depthMask(true);
-
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LEQUAL);
 
@@ -308,11 +330,10 @@ export class Renderer {
       gl.drawArrays(gl.LINES, 0, world.branchCount);
     }
 
-    // Additive particles + nodes
+    // Particles + nodes (additive)
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
     gl.depthMask(false);
-
     gl.useProgram(this.programs.particle);
     gl.uniformMatrix4fv(U.particle.uViewProj, false, vp);
     gl.uniform3fv(U.particle.uCameraPos, camera.position);
@@ -328,6 +349,83 @@ export class Renderer {
 
     gl.depthMask(true);
     gl.disable(gl.BLEND);
+  }
+
+  render(camera, world, time) {
+    const gl = this.gl, U = this.uniforms;
+
+    const proj = mat4.create();
+    mat4.perspective(proj, Math.PI / 3, this.width / this.height, 0.1, 250);
+    const view = mat4.create();
+    mat4.lookAt(view, camera.position, camera.target, [0, 1, 0]);
+    const vp = mat4.create();
+    mat4.multiply(vp, proj, view);
+
+    if (!this.fboReady) {
+      // Fallback: render directly to screen
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, this.width, this.height);
+      gl.clearColor(0, 0, 0.008, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.disable(gl.BLEND);
+      this.drawScene(vp, camera, world, time);
+      gl.bindVertexArray(null);
+      return;
+    }
+
+    // === Render scene to FBO ===
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._sceneFBO);
+    gl.viewport(0, 0, this.width, this.height);
+    gl.clearColor(0, 0, 0.008, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.BLEND);
+
+    this.drawScene(vp, camera, world, time);
+
+    // === Post-processing ===
+    gl.disable(gl.DEPTH_TEST);
+    gl.bindVertexArray(this.vaos.quad);
+    const qw = Math.max(1, this.width >> 2), qh = Math.max(1, this.height >> 2);
+
+    // Bright extract
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this._brightFBO);
+    gl.viewport(0, 0, qw, qh);
+    gl.useProgram(this.programs.bright);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._sceneTex);
+    gl.uniform1i(U.bright.uScene, 0);
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+    // Blur passes
+    gl.useProgram(this.programs.blur);
+    for (let pass = 0; pass < 2; pass++) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._blur1FBO);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, pass === 0 ? this._brightTex : this._blur2Tex);
+      gl.uniform1i(U.blur.uInput, 0);
+      gl.uniform2f(U.blur.uDirection, 1, 0);
+      gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._blur2FBO);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this._blur1Tex);
+      gl.uniform1i(U.blur.uInput, 0);
+      gl.uniform2f(U.blur.uDirection, 0, 1);
+      gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+    }
+
+    // Composite to screen
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.width, this.height);
+    gl.useProgram(this.programs.post);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this._sceneTex);
+    gl.uniform1i(U.post.uScene, 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this._blur2Tex);
+    gl.uniform1i(U.post.uBloom, 1);
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
     gl.bindVertexArray(null);
   }
 }

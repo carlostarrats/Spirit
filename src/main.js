@@ -7,11 +7,7 @@ const debugEl = document.getElementById('debug');
 
 canvas.addEventListener('webglcontextlost', e => {
   e.preventDefault();
-  debugEl.textContent = 'WebGL CONTEXT LOST';
-  console.error('WebGL context lost');
-});
-canvas.addEventListener('webglcontextrestored', () => {
-  debugEl.textContent = 'Context restored - reload page';
+  debugEl.textContent = 'WebGL CONTEXT LOST - reload page';
 });
 
 const renderer = new Renderer(canvas);
@@ -36,30 +32,47 @@ const keys = {};
 document.addEventListener('keydown', e => { keys[e.code] = true; });
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 
-// right-drag to rotate camera
-let rightDrag = false, lastMX = 0, lastMY = 0;
+// Hold Ctrl + move mouse to look around freely
+// Right-click drag also works
+let looking = false, lastMX = 0, lastMY = 0;
 
 canvas.addEventListener('mousedown', e => {
   if (e.button === 2) {
-    rightDrag = true;
-    lastMX = e.clientX;
-    lastMY = e.clientY;
+    looking = true;
+    lastMX = e.clientX; lastMY = e.clientY;
+    e.preventDefault();
   }
 });
-window.addEventListener('mouseup', e => { if (e.button === 2) rightDrag = false; });
+
+window.addEventListener('mouseup', e => {
+  if (e.button === 2) looking = false;
+});
+
 canvas.addEventListener('mousemove', e => {
-  if (rightDrag) {
-    yaw -= (e.clientX - lastMX) * 0.004;
-    pitch -= (e.clientY - lastMY) * 0.004;
+  // Ctrl+mouse OR right-drag to look around
+  const ctrlLook = (e.ctrlKey || e.metaKey) && e.buttons === 0;
+
+  if (looking || ctrlLook) {
+    if (!looking && ctrlLook) {
+      // first frame of ctrl-look, init lastM
+      if (!lastMX && !lastMY) { lastMX = e.clientX; lastMY = e.clientY; return; }
+    }
+    const dx = e.clientX - lastMX;
+    const dy = e.clientY - lastMY;
+    yaw -= dx * 0.004;
+    pitch -= dy * 0.004;
     pitch = Math.max(-1.2, Math.min(1.2, pitch));
+    lastMX = e.clientX; lastMY = e.clientY;
+  } else {
     lastMX = e.clientX; lastMY = e.clientY;
   }
 });
+
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 
-// click to move
+// Click to move (only when NOT holding ctrl)
 canvas.addEventListener('click', e => {
-  if (e.button !== 0) return;
+  if (e.button !== 0 || e.ctrlKey || e.metaKey) return;
   const rect = canvas.getBoundingClientRect();
   const ndcX = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   const ndcY = 1 - ((e.clientY - rect.top) / rect.height) * 2;
@@ -67,12 +80,11 @@ canvas.addEventListener('click', e => {
   if (!ray) return;
   const hit = raycastTerrain(camera.position, ray);
   if (hit) {
-    // clamp max walk distance to 40m
     const dx = hit[0] - px, dz = hit[2] - pz;
     const d = Math.sqrt(dx * dx + dz * dz);
-    if (d > 40) {
-      hit[0] = px + (dx / d) * 40;
-      hit[2] = pz + (dz / d) * 40;
+    if (d > 50) {
+      hit[0] = px + (dx / d) * 50;
+      hit[2] = pz + (dz / d) * 50;
       hit[1] = terrainHeight(hit[0], hit[2]);
     }
     walkTarget = hit;
@@ -124,10 +136,10 @@ function lerpAngle(from, to, t) {
 
 function frame(ts) {
   requestAnimationFrame(frame);
-  try {
-    tick(ts);
-  } catch (e) {
+  try { tick(ts); }
+  catch (e) {
     console.error('Frame error:', e);
+    debugEl.textContent = 'ERROR: ' + e.message;
   }
 }
 
@@ -150,7 +162,6 @@ function tick(ts) {
   if (keys['KeyS'] || keys['ArrowDown']) { mx -= fwd[0]; mz -= fwd[2]; }
   if (keys['KeyA'] || keys['ArrowLeft']) { mx -= right[0]; mz -= right[2]; }
   if (keys['KeyD'] || keys['ArrowRight']) { mx += right[0]; mz += right[2]; }
-
   const mLen = Math.sqrt(mx * mx + mz * mz);
   if (mLen > 0) {
     walkTarget = null;
@@ -178,7 +189,6 @@ function tick(ts) {
   camera.position[0] = px;
   camera.position[1] = groundY + EYE_HEIGHT;
   camera.position[2] = pz;
-
   const lookX = Math.sin(yaw) * Math.cos(pitch);
   const lookY = Math.sin(pitch);
   const lookZ = Math.cos(yaw) * Math.cos(pitch);
@@ -188,8 +198,6 @@ function tick(ts) {
 
   // world gen
   world.update(px, pz);
-
-  // sync buffers: only rebuild + upload together
   if (world.dirty || needsWorldUpload) {
     world.buildBuffers(px, pz);
     renderer.uploadWorld(world);
@@ -217,7 +225,6 @@ function tick(ts) {
   // stones
   if (pz + 80 > world._stoneMaxZ || pz - 80 < world._stoneMinZ) {
     world.generateStonePath(pz, 120);
-    // only re-upload stones, not branches
     const gl = renderer.gl;
     gl.bindBuffer(gl.ARRAY_BUFFER, renderer.buffers.stoneV);
     gl.bufferData(gl.ARRAY_BUFFER, world.stoneVerts, gl.STATIC_DRAW);
@@ -225,15 +232,15 @@ function tick(ts) {
 
   renderer.render(camera, world, time);
 
-  // debug overlay
+  // debug
   frameCount++;
   if (frameCount % 30 === 0) {
     const err = renderer.gl.getError();
-    debugEl.textContent = `pos: ${px.toFixed(1)}, ${pz.toFixed(1)} | trees: ${world.branchCount} verts | grass: ${world.grassVertCount} | GL: ${err === 0 ? 'OK' : 'ERR ' + err}${walkTarget ? ' | walking' : ''}`;
+    debugEl.textContent = `pos: ${px.toFixed(1)}, ${pz.toFixed(1)} | branches: ${world.branchCount} | grass: ${world.grassVertCount} | GL: ${err === 0 ? 'OK' : 'ERR ' + err}${walkTarget ? ' | walking' : ''} | FBO: ${renderer.fboReady ? 'yes' : 'NO'}`;
   }
 }
 
-// initial setup
+// init
 world.buildTerrain(0, 0);
 renderer.uploadTerrain(world);
 world.buildGrass(0, 0);
