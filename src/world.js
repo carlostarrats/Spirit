@@ -21,7 +21,7 @@ export class World {
     this.grassVerts = null;
     this.grassVertCount = 0;
 
-    this.maxParticles = 800;
+    this.maxParticles = 600;
     this.particlePos = new Float32Array(this.maxParticles * 4);
     this.particleVel = new Float32Array(this.maxParticles * 3);
     this.particleLife = new Float32Array(this.maxParticles);
@@ -31,8 +31,7 @@ export class World {
     this.generatedChunks = new Set();
     this.dirty = true;
 
-    this.generateArea(0, 0, 80);
-    this.buildBuffers();
+    this.generateArea(0, 0, 75);
     this.generateStonePath(0, 100);
     this.initParticles();
   }
@@ -47,6 +46,7 @@ export class World {
     const maxX = Math.floor((cx + radius) / cs);
     const minZ = Math.floor((cz - radius) / cs);
     const maxZ = Math.floor((cz + radius) / cs);
+    let added = false;
 
     for (let xi = minX; xi <= maxX; xi++) {
       for (let zi = minZ; zi <= maxZ; zi++) {
@@ -54,8 +54,10 @@ export class World {
         if (this.generatedChunks.has(key)) continue;
         this.generatedChunks.add(key);
         this.generateChunk(xi * cs, zi * cs, cs);
+        added = true;
       }
     }
+    if (added) this.dirty = true;
   }
 
   generateChunk(ox, oz, size) {
@@ -77,17 +79,22 @@ export class World {
         const height = 5 + sizeN * 16;
 
         const treeSeed = Math.floor((wx * 73856093 + wz * 19349663) & 0xFFFFFF);
-        this.trees.push(this.generateTree(wx, wz, ty, height, treeSeed));
+        const tree = this.generateTree(wx, wz, ty, height, treeSeed);
+        tree.bx = wx;
+        tree.bz = wz;
+        this.trees.push(tree);
         this.treeMeta.push({ x: wx, z: wz, y: ty, height });
 
         if (noise2d(wx * 0.5 + 777, wz * 0.5) > 0.1) {
           const fx = wx + noise2d(wx, wz) * 2;
           const fz = wz + noise2d(wz, wx) * 2;
-          this.trees.push(this.generateFern(fx, fz, terrainHeight(fx, fz), treeSeed + 1));
+          const fern = this.generateFern(fx, fz, terrainHeight(fx, fz), treeSeed + 1);
+          fern.bx = fx;
+          fern.bz = fz;
+          this.trees.push(fern);
         }
       }
     }
-    this.dirty = true;
   }
 
   generateTree(bx, bz, by, height, seed) {
@@ -178,15 +185,12 @@ export class World {
     for (let z = centerZ - range; z < centerZ + range;) {
       const gap = 1.0 + Math.abs(noise2d(z * 0.5, 0)) * 0.8;
       z += gap;
-
       const pathX = this.getPathX(z);
       const sx = pathX + noise2d(z * 0.3, 100) * 0.4;
       const sz = z + noise2d(z * 0.3 + 50, 100) * 0.25;
       const sy = terrainHeight(sx, sz) + 0.015;
-
       let seed = Math.floor((sx * 73856 + sz * 19349) & 0xFFFF);
       function rng() { seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF; return (seed >>> 0) / 4294967296; }
-
       const sides = 5 + Math.floor(rng() * 3);
       const radius = 0.1 + rng() * 0.16;
       const pts = [];
@@ -207,12 +211,20 @@ export class World {
     this._stoneMaxZ = centerZ + range;
   }
 
-  buildBuffers() {
-    const allSegs = [], allNodes = [];
+  buildBuffers(px, pz) {
+    const allSegs = [];
+    const allNodes = [];
+    const maxDist2 = 75 * 75;
+
     for (const tree of this.trees) {
+      if (tree.bx !== undefined) {
+        const dx = tree.bx - px, dz = tree.bz - pz;
+        if (dx * dx + dz * dz > maxDist2) continue;
+      }
       for (let i = 0; i < tree.segs.length; i++) allSegs.push(tree.segs[i]);
       for (let i = 0; i < tree.nodes.length; i++) allNodes.push(tree.nodes[i]);
     }
+
     this.branchVerts = new Float32Array(allSegs);
     this.branchCount = allSegs.length / 4;
     this.nodeVerts = new Float32Array(allNodes);
@@ -220,34 +232,53 @@ export class World {
     this.dirty = false;
   }
 
+  cleanupDistant(px, pz) {
+    const maxDist2 = 110 * 110;
+    const prevLen = this.trees.length;
+    this.trees = this.trees.filter(t =>
+      t.bx === undefined || ((t.bx - px) ** 2 + (t.bz - pz) ** 2 < maxDist2)
+    );
+    this.treeMeta = this.treeMeta.filter(t =>
+      (t.x - px) ** 2 + (t.z - pz) ** 2 < maxDist2
+    );
+    if (this.trees.length !== prevLen) this.dirty = true;
+  }
+
   buildTerrain(px, pz) {
-    const size = 120, step = 2;
+    const size = 100, step = 2;
     const n = Math.floor(size / step) * 2 + 1;
     const bx = Math.floor(px / step) * step;
     const bz = Math.floor(pz / step) * step;
-    const verts = [];
+    const verts = new Float32Array(n * n * 3);
+    let vi = 0;
     for (let zi = 0; zi < n; zi++)
       for (let xi = 0; xi < n; xi++) {
         const wx = bx - size + xi * step, wz = bz - size + zi * step;
-        verts.push(wx, terrainHeight(wx, wz), wz);
+        verts[vi++] = wx;
+        verts[vi++] = terrainHeight(wx, wz);
+        verts[vi++] = wz;
       }
-    const indices = [];
+    const indices = new Uint32Array((n - 1) * (n - 1) * 6);
+    let ii = 0;
     for (let z = 0; z < n - 1; z++)
       for (let x = 0; x < n - 1; x++) {
         const i = z * n + x;
-        indices.push(i, i + 1, i + n, i + 1, i + n + 1, i + n);
+        indices[ii++] = i; indices[ii++] = i + 1; indices[ii++] = i + n;
+        indices[ii++] = i + 1; indices[ii++] = i + n + 1; indices[ii++] = i + n;
       }
-    this.terrainVerts = new Float32Array(verts);
-    this.terrainIndices = new Uint32Array(indices);
+    this.terrainVerts = verts;
+    this.terrainIndices = indices;
     this.terrainIdxCount = indices.length;
   }
 
   buildGrass(px, pz) {
-    const data = [];
-    const range = 55, spacing = 0.55;
+    const range = 45, spacing = 0.6;
+    const maxBlades = 30000;
+    const data = new Float32Array(maxBlades * 12); // 2 verts * 6 floats
+    let count = 0;
 
-    for (let x = px - range; x < px + range; x += spacing) {
-      for (let z = pz - range; z < pz + range; z += spacing) {
+    for (let x = px - range; x < px + range && count < maxBlades; x += spacing) {
+      for (let z = pz - range; z < pz + range && count < maxBlades; z += spacing) {
         const jx = noise2d(x * 2.3 + 500, z * 2.3 + 500) * spacing * 0.4;
         const jz = noise2d(x * 2.3 + 600, z * 2.3 + 600) * spacing * 0.4;
         const gx = x + jx, gz = z + jz;
@@ -262,13 +293,19 @@ export class World {
         const h = 0.35 + Math.abs(noise2d(gx * 0.15, gz * 0.15)) * 0.55;
         const phase = noise2d(gx * 0.7, gz * 0.7) * Math.PI * 2;
 
-        // base vertex then tip vertex
-        data.push(gx, gy, gz, h, phase, 0);
-        data.push(gx, gy, gz, h, phase, 1);
+        const off = count * 12;
+        // base
+        data[off] = gx; data[off + 1] = gy; data[off + 2] = gz;
+        data[off + 3] = h; data[off + 4] = phase; data[off + 5] = 0;
+        // tip
+        data[off + 6] = gx; data[off + 7] = gy; data[off + 8] = gz;
+        data[off + 9] = h; data[off + 10] = phase; data[off + 11] = 1;
+        count++;
       }
     }
-    this.grassVerts = new Float32Array(data);
-    this.grassVertCount = data.length / 6;
+
+    this.grassVerts = data.subarray(0, count * 12);
+    this.grassVertCount = count * 2;
   }
 
   initParticles() {
@@ -303,11 +340,12 @@ export class World {
       const lr = this.particleLife[i] / 5.0;
       this.particlePos[idx + 3] = Math.min(1.0, lr * 2.0) * (0.3 + Math.random() * 0.2);
       const dx = this.particlePos[idx] - cx, dz = this.particlePos[idx + 2] - cz;
-      if (dx * dx + dz * dz > 65 * 65) this.spawnParticle(i);
+      if (dx * dx + dz * dz > 60 * 60) this.spawnParticle(i);
     }
   }
 
   update(px, pz) {
     this.generateArea(px, pz, 70);
+    this.cleanupDistant(px, pz);
   }
 }
