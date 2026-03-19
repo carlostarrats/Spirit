@@ -108,6 +108,11 @@ function lerpAngle(from, to, t) {
 }
 
 function frame(ts) {
+  try { _frame(ts); } catch (e) { console.error('Frame error:', e); }
+  requestAnimationFrame(frame);
+}
+
+function _frame(ts) {
   const time = ts * 0.001;
   const dt = Math.min(lastTime ? time - lastTime : 0.016, 0.05);
   lastTime = time;
@@ -192,7 +197,6 @@ function frame(ts) {
   }
 
   renderer.render(camera, world, time);
-  requestAnimationFrame(frame);
 }
 
 // init

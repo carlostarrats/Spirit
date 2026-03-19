@@ -309,6 +309,5 @@ export class World {
 
   update(px, pz) {
     this.generateArea(px, pz, 70);
-    if (this.dirty) this.buildBuffers();
   }
 }
